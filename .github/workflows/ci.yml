@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch makes the first run's result irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Everything `make pre-commit` runs locally, as separate steps rather than
+  # one `pre-commit` invocation: the targets are identical either way, and
+  # splitting them means a failure names itself in the job list instead of
+  # having to be read out of a combined log.
+  check:
+    name: fmt, clippy, test, no_std, docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # `make doc` needs nightly for the `doc_cfg` feature gate that renders
+      # the feature annotations docs.rs shows; everything else here runs on
+      # the runner's stable toolchain. Both are installed rather than pinned
+      # in a `rust-toolchain.toml`, because unlike the bare-metal crates
+      # beside this one there is nothing here that actually requires a
+      # specific channel -- pinning would assert a constraint that doesn't
+      # exist.
+      - name: Install toolchains and no_std targets
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component rustfmt --component clippy \
+            --target thumbv7em-none-eabi \
+            --target aarch64-unknown-none-softfloat
+          rustup toolchain install nightly --profile minimal
+          rustup default stable
+          cargo --version
+
+      # The host test suite validates the images it writes with `fsck.vfat`
+      # and cross-checks their contents with `mtools`, neither of which
+      # shares this crate's assumptions. Installed unconditionally so a
+      # missing oracle is a setup failure here rather than a silently
+      # skipped check later.
+      - name: Install the filesystem test oracles
+        run: sudo apt-get update && sudo apt-get install -y dosfstools mtools
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: make fmt-check
+      - run: make clippy
+
+      # Built as its own step rather than left to `make test`'s dependency,
+      # so a fixture-generation failure names itself instead of appearing as
+      # a test failure. Deterministic and sparse: about eight seconds and
+      # 28 MB on disk for nominally 3.5 GB of images, which is why they are
+      # generated per run rather than cached or committed.
+      - run: make fixtures
+
+      - run: make test
+      - run: make no-std
+      - run: make doc
+
+  # Guards the `rust-version` claim in Cargo.toml. Without this the MSRV is
+  # a comment that rots the first time a dependency or a `core` API moves.
+  #
+  # Builds the library only -- not the tests, which are free to use whatever
+  # the current toolchain offers, since a consumer never compiles them.
+  msrv:
+    name: library builds on the declared MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install 1.85
+        run: rustup toolchain install 1.85 --profile minimal
+
+      - run: cargo +1.85 build --all-features
+
+  # `cargo package` finishes by building the packaged tarball, which catches
+  # a whole class of "works here, broken on crates.io" problems: a file the
+  # manifest excludes but the build needs, or a path that only resolves in
+  # this working copy.
+  #
+  # Deliberately uncached. `cargo package` unpacks the tarball into
+  # `target/package/` and builds it there, and the cache action's cleanup
+  # walks `target` expecting a normal layout. Nothing to gain by keeping it:
+  # the verify build is one small crate.
+  package:
+    name: package verifies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: make package

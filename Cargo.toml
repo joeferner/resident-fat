@@ -1,0 +1,105 @@
+[package]
+name = "resident-fat"
+version = "0.1.0"
+edition = "2024"
+description = "FAT32 filesystem that keeps the file allocation table and directories in RAM, so file data moves in whole contiguous runs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/joeferner/resident-fat"
+documentation = "https://docs.rs/resident-fat"
+readme = "README.md"
+keywords = ["fat32", "filesystem", "no-std", "embedded", "sd-card"]
+categories = ["filesystem", "no-std", "embedded"]
+# Tracked files with no reader outside this repository: a consumer's build
+# never consults any of them, and they describe how *this* repository is
+# checked, versioned and published rather than anything about using the
+# crate. Nothing shipped links to them, so leaving them out strands no
+# reference.
+#
+# `tests/` is the entry worth explaining, because shipping a test suite is
+# usually a kindness. Here it would be a broken one: the suite runs against
+# FAT32 images that `scripts/mkfixtures.sh` generates, and those images are
+# not tracked -- they are 3.5 GB nominal, and deterministic enough to
+# rebuild rather than store. So the tests in a published tarball could never
+# run from it. They would also need `dosfstools` and `mtools` present, since
+# the suite uses `fsck.vfat` and `mtools` as its oracles and fails rather
+# than skipping when they are missing. `scripts/` and `Makefile` go with
+# them for the same reason: they exist to drive that suite.
+#
+# The place to run these is the repository, where `make test` builds the
+# fixtures first. CI does exactly that on every change.
+exclude = [
+    ".github/",
+    ".gitignore",
+    "Makefile",
+    "RELEASING.md",
+    "scripts/",
+    "tests/",
+]
+# 1.85 is exactly the toolchain that stabilised edition 2024, so the edition
+# above is what sets this floor -- nothing in the source needs a compiler
+# anywhere near that recent. A first release may as well start on the
+# current edition rather than migrate published code later, and the move
+# cost nothing in behaviour: `cargo fix --edition` had no fix to apply, and
+# the crate has no `unsafe`, no `static mut` and no `impl Drop` at all, so
+# none of the 2024 changes that bite -- unsafe-op-in-unsafe-fn, RPIT capture,
+# tail-expression drop order -- reach it. What did change is rustfmt's own
+# 2024 style rules, which reordered some `use` lists.
+#
+# CI's `msrv` job builds the library on 1.85 and is what keeps this claim
+# from rotting into a comment. Should the floor ever need lowering for a
+# consumer pinned further back, the edition is the thing to give up first.
+rust-version = "1.85"
+
+[dependencies]
+# Error boilerplate. `default-features = false` is what keeps this `no_std`:
+# thiserror's `std` feature only adds convenience formatting for
+# `std::path`, and without it the derive implements `core::error::Error`.
+#
+# Not a public dependency despite appearing on every error type: what the
+# derive produces is `Display` and `core::error::Error` impls, so nothing
+# from this crate crosses the API boundary.
+thiserror = { version = "2.0", default-features = false }
+# The `embedded-sdmmc` bridge (see the feature of the same name): a blanket
+# adapter from that crate's `BlockDevice` to this one's, so a driver already
+# implementing the de-facto embedded block device trait -- which is most of
+# the SD card drivers there are -- works here with no glue at the call site.
+#
+# Optional, and a *public* dependency when enabled: its `BlockDevice` appears
+# in this crate's API surface, so a semver-breaking release there is a
+# semver-breaking release here. That is the price of the bridge and the
+# reason it is not a default feature.
+#
+# Pinned to 0.9 rather than the current 0.10 on purpose. A bridge is only
+# useful if it names the *same* trait the block device provider implements,
+# and cargo treats 0.9's `BlockDevice` and 0.10's as unrelated types. The
+# drivers this has to accept are on 0.9, so bridging 0.10 would compile fine
+# and then accept nothing. Track whatever the providers use, not whatever is
+# newest; if they diverge, this becomes two features rather than one moving
+# pin.
+embedded-sdmmc = { version = "0.9.0", default-features = false, optional = true }
+
+[dev-dependencies]
+# Reads the fixture manifest, which carries the cluster layout `fatmap.py`
+# found. Tests compare what this crate walks against those numbers, so the
+# ground truth comes from outside the code being tested.
+serde_json = "1.0"
+
+[features]
+default = []
+# Blanket `BlockDevice` bridge from `embedded-sdmmc`. See the dependency
+# comment above on why this is opt-in.
+embedded-sdmmc = ["dep:embedded-sdmmc"]
+# Reading MBR partition tables, so that mounting a card written by an
+# imaging tool does not need a second crate. About a hundred lines and no
+# dependencies; opt-in so that a consumer mounting a bare volume does not
+# compile a parser it will never call. GPT is not supported and is not
+# planned -- see `src/mbr.rs`.
+mbr = []
+
+[package.metadata.docs.rs]
+# Build the bridge into the published documentation, and pass the same
+# `--cfg docsrs` that `make doc` does, so the feature-gate annotations
+# rendered on docs.rs are exercised locally rather than first failing on
+# the docs.rs builder after a release is already published.
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
