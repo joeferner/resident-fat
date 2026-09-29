@@ -300,6 +300,15 @@ pub enum Error<E> {
         index: usize,
     },
 
+    /// The device has a partition table and no FAT partition in it.
+    ///
+    /// Its own case rather than [`Error::NoPartitionTable`], which would be
+    /// the wrong diagnosis: there *is* a table, and the fix is a different
+    /// one — the card was imaged with some other layout, or its FAT
+    /// partition was given another type.
+    #[error("no FAT partition in the partition table")]
+    NoFatPartition,
+
     /// The allocation table was inconsistent, or had no room.
     ///
     /// Nested rather than flattened because these are exactly the failures

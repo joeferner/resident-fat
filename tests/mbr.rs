@@ -16,7 +16,7 @@
 mod support;
 
 use resident_fat::mbr::PartitionTable;
-use resident_fat::{BootError, Error, FileSystem, Geometry};
+use resident_fat::{BlockDevice, BootError, Error, FileSystem, Geometry};
 use support::*;
 
 /// Where `scripts/mkfixtures.sh` puts the partition.
@@ -191,5 +191,124 @@ fn a_volume_overflowing_its_partition_is_refused() {
     match FileSystem::mount_partition(Reticent(image), 0).map(|_| ()) {
         Err(Error::Boot(BootError::BadGeometry(Geometry::VolumeTooLarge { .. }))) => {}
         other => panic!("expected VolumeTooLarge, got {other:?}"),
+    }
+}
+
+/// A device whose block 0 reads as `table` and is otherwise `D`'s: a
+/// different partition table over the same volume, without copying an image
+/// half a gigabyte long to get one.
+struct Retabled<D> {
+    inner: D,
+    table: [u8; 512],
+}
+
+impl<D: BlockDevice> BlockDevice for Retabled<D> {
+    type Error = D::Error;
+
+    fn read(&mut self, start_block: u64, blocks: &mut [u8]) -> Result<(), Self::Error> {
+        self.inner.read(start_block, blocks)?;
+        if start_block == 0 {
+            blocks[..512].copy_from_slice(&self.table);
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, start_block: u64, blocks: &[u8]) -> Result<(), Self::Error> {
+        self.inner.write(start_block, blocks)
+    }
+
+    fn block_count(&mut self) -> Result<Option<u64>, Self::Error> {
+        self.inner.block_count()
+    }
+}
+
+/// `fat32-mbr.img`'s table, with `edit` applied to it.
+fn retabled(edit: impl FnOnce(&mut [u8; 512])) -> Retabled<FileImage> {
+    let mut table = [0u8; 512];
+    let mut inner = FileImage::open(fixture("fat32-mbr.img")).expect("open");
+    // Block 0 alone: the image is half a gigabyte, and reading all of it
+    // for its first 512 bytes is what the wrapper exists to avoid.
+    inner.read(0, &mut table).expect("read the table");
+    edit(&mut table);
+    Retabled { inner, table }
+}
+
+/// Where slot `n`'s sixteen bytes start in the table.
+fn slot(n: usize) -> usize {
+    0x1BE + 16 * n
+}
+
+/// Through a partition table, the first FAT partition is the volume — the
+/// same one `mount_partition` finds by its slot.
+#[test]
+fn the_first_fat_partition_is_mounted() {
+    let mut first =
+        FileSystem::mount_first_fat(FileImage::open(fixture("fat32-mbr.img")).expect("open"))
+            .expect("mount the first FAT partition");
+    let mut by_slot =
+        FileSystem::mount_partition(FileImage::open(fixture("fat32-mbr.img")).expect("open"), 0)
+            .expect("mount partition 0");
+
+    assert_eq!(first.first_block(), PARTITION_START);
+    assert_eq!(first.boot_sector(), by_slot.boot_sector());
+    let a = first.open("/BIG.BIN").expect("open");
+    let b = by_slot.open("/BIG.BIN").expect("open");
+    assert_eq!(
+        first.read_all(&a).expect("read"),
+        by_slot.read_all(&b).expect("read")
+    );
+}
+
+/// By type byte, not by slot: a FAT volume in slot 1 behind something else
+/// in slot 0 is found, which counting from slot 0 would have got wrong.
+#[test]
+fn the_fat_partition_is_found_by_type_not_by_slot() {
+    let device = retabled(|table| {
+        // The FAT entry moves to slot 1, and slot 0 becomes a Linux
+        // partition somewhere else on the device.
+        let fat: [u8; 16] = table[slot(0)..slot(1)].try_into().unwrap();
+        table[slot(1)..slot(2)].copy_from_slice(&fat);
+        table[slot(0) + 4] = 0x83;
+        table[slot(0) + 8..slot(0) + 12].copy_from_slice(&2048u32.to_le_bytes());
+        table[slot(0) + 12..slot(0) + 16].copy_from_slice(&4096u32.to_le_bytes());
+    });
+    let volume = FileSystem::mount_first_fat(device).expect("mount");
+    assert_eq!(volume.first_block(), PARTITION_START);
+}
+
+/// With no partition table, the device is the volume.
+#[test]
+fn a_bare_volume_mounts_as_itself() {
+    for name in ["fat32-4k.img", "fat32-frag.img"] {
+        let first = FileSystem::mount_first_fat(FileImage::open(fixture(name)).expect("open"))
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        let bare = FileSystem::mount(FileImage::open(fixture(name)).expect("open")).expect("mount");
+        assert_eq!(first.first_block(), 0, "{name}");
+        assert_eq!(first.boot_sector(), bare.boot_sector(), "{name}");
+    }
+}
+
+/// A table with nothing FAT in it is its own error, not a fall back to
+/// block 0 — which would look for a boot sector where the table is, and
+/// fail one step further from the cause.
+#[test]
+fn a_table_with_no_fat_partition_says_so() {
+    let device = retabled(|table| table[slot(0) + 4] = 0x83);
+    match FileSystem::mount_first_fat(device).map(|_| ()) {
+        Err(Error::NoFatPartition) => {}
+        other => panic!("expected NoFatPartition, got {other:?}"),
+    }
+}
+
+/// A GPT disk's placeholder table is declined, as `mount_partition` does.
+#[test]
+fn a_protective_gpt_table_is_declined_by_first_fat_too() {
+    let device = retabled(|table| {
+        table[slot(0) + 4] = 0xEE;
+        table[slot(0) + 8..slot(0) + 12].copy_from_slice(&1u32.to_le_bytes());
+    });
+    match FileSystem::mount_first_fat(device).map(|_| ()) {
+        Err(Error::NoPartitionTable) => {}
+        other => panic!("expected NoPartitionTable, got {other:?}"),
     }
 }

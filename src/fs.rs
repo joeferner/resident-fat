@@ -299,6 +299,58 @@ impl<D: BlockDevice> FileSystem<D> {
         )
     }
 
+    /// Mounts the device's FAT volume, whichever way it was formatted.
+    ///
+    /// For a card whose layout is not known in advance, which is most of
+    /// them. With a partition table, this mounts the first partition whose
+    /// type byte says FAT — by type rather than by slot, because imaging
+    /// tools usually put the volume in slot 0 but not always, and a card
+    /// with a separate data partition has more than one entry. Like
+    /// [`mount_partition`], the volume is held to that partition's length.
+    /// With no table, the device is one bare volume, as some tools format a
+    /// small card, and this is [`mount`].
+    ///
+    /// Telling the two apart is the part worth not writing by hand: a boot
+    /// sector and a partition table end with the same `0x55AA`, so the
+    /// obvious check answers yes to either — see
+    /// [`crate::mbr::PartitionTable::read`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoFatPartition`] when there is a table and nothing in it is
+    /// FAT. [`Error::NoPartitionTable`] for the placeholder table a GPT disk
+    /// carries, which this declines as [`mount_partition`] does. Otherwise
+    /// whatever mounting the volume found.
+    ///
+    /// [`mount`]: Self::mount
+    /// [`mount_partition`]: Self::mount_partition
+    #[cfg(feature = "mbr")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mbr")))]
+    pub fn mount_first_fat(mut device: D) -> Result<Self, D::Error> {
+        let Some(table) = crate::mbr::PartitionTable::read(&mut device)? else {
+            return Self::mount(device);
+        };
+        if table.iter().any(|partition| partition.is_protective_gpt()) {
+            return Err(Error::NoPartitionTable);
+        }
+        let partition = *table.first_fat().ok_or(Error::NoFatPartition)?;
+        Self::mount_within(
+            device,
+            partition.first_block,
+            Codepage::ASCII,
+            Some(partition.blocks),
+        )
+    }
+
+    /// The device block the volume begins at: 0 for a bare volume, the
+    /// partition's first block for one mounted through a table.
+    ///
+    /// For a board's console line about what it mounted, which is where a
+    /// card imaged differently from the last one first shows.
+    pub fn first_block(&self) -> u64 {
+        self.first_block
+    }
+
     /// The volume's validated geometry.
     pub fn boot_sector(&self) -> &BootSector {
         &self.boot
