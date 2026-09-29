@@ -829,6 +829,33 @@ impl<D: BlockDevice> FileSystem<D> {
         Err(Error::DirectoryFull)
     }
 
+    /// One directory entry, as the device holds it.
+    ///
+    /// For an operation that has to carry fields this crate does not model
+    /// from one entry to another — a rename keeps a file's timestamps and
+    /// attributes exactly — rather than rebuild them from the parsed view.
+    pub(crate) fn read_entry(
+        &mut self,
+        directory: u32,
+        index: u32,
+    ) -> Result<[u8; ENTRY_SIZE], D::Error> {
+        let (block, offset) = self.entry_location(directory, index)?;
+        let mut buffer = [0u8; BLOCK_SIZE];
+        self.read_blocks(block, &mut buffer)?;
+        let mut entry = [0u8; ENTRY_SIZE];
+        entry.copy_from_slice(&buffer[offset..offset + ENTRY_SIZE]);
+        Ok(entry)
+    }
+
+    /// Makes every handle into `directory` stale, as a deletion there would.
+    ///
+    /// For a change that repoints an entry at other clusters without freeing
+    /// its slot: a handle to what the entry used to name would still pass
+    /// the name check, and write into clusters that are about to be freed.
+    pub(crate) fn invalidate_handles(&mut self, directory: u32) {
+        *self.deletions.entry(directory).or_insert(0) += 1;
+    }
+
     /// Reads, changes and writes back one directory entry.
     ///
     /// The whole block is rewritten because a block is the smallest thing a

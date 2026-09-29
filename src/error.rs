@@ -402,6 +402,19 @@ pub enum Error<E> {
         name: alloc::string::String,
     },
 
+    /// A directory was asked to move inside itself, or inside something
+    /// it contains.
+    ///
+    /// Carried out, that would unhook the directory from the tree it is
+    /// part of: its new parent would be reachable only through the
+    /// directory itself, so the whole subtree would be allocated and found
+    /// by nothing.
+    #[error("{name} cannot be moved inside itself")]
+    MoveIntoItself {
+        /// The directory that was to be moved.
+        name: alloc::string::String,
+    },
+
     /// A [`File`](crate::File) was used after its directory slot stopped
     /// being its own.
     ///

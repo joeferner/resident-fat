@@ -8,14 +8,17 @@ A FAT32 filesystem that spends memory to move data in whole runs.
 
 ## Status
 
-**Early.** A FAT32 volume can be mounted, walked, read, written, grown and
-truncated; long names and directories are both read and created. Every
-claim below is checked against `fsck.vfat` and `mtools`, which are
-independent implementations.
+**Early.** A FAT32 volume can be mounted, walked, read, written, grown,
+truncated and renamed; long names and directories are both read and
+created, and files and directories move between directories. Every claim
+below is checked against `fsck.vfat` and `mtools`, which are independent
+implementations, including what an interruption at each write leaves
+behind.
 
-What is missing is native adapters for the block devices real hardware
-provides — the `bridge` module, behind the `embedded-sdmmc` feature, covers
-those in the meantime. The version number should be read as an early one,
+Block devices come from outside: implement `BlockDevice` for your driver,
+use a HAL that already does — `rpi-hal`'s SD adapters do — or bridge one
+you have for `embedded-sdmmc` through the `bridge` module, behind the
+feature of that name. The version number should be read as an early one,
 and the API will change.
 
 ## Why a card is slow
@@ -57,6 +60,24 @@ fn load<D: BlockDevice>(device: D) -> Result<Vec<u8>, D::Error> {
 
 That read is a single device transfer if the file is contiguous, whatever
 its size.
+
+To replace a file so that a power cut cannot leave half of it, write the
+new contents beside it and rename them over:
+
+```rust
+use resident_fat::{BlockDevice, FileSystem, Result};
+
+fn save<D: BlockDevice>(volume: &mut FileSystem<D>, text: &[u8]) -> Result<(), D::Error> {
+    volume.write_file("/settings.new", text)?;
+    volume.rename("/settings.new", "/settings.toml")?;
+    volume.sync()
+}
+```
+
+Interrupted anywhere, `/settings.toml` is the old file or the new one,
+whole. FAT has no atomic rename, so that guarantee comes from the order of
+the writes, and `FileSystem::rename` documents what each kind of rename
+leaves behind.
 
 ## Mounting
 

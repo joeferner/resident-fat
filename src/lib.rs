@@ -37,15 +37,18 @@
 //!
 //! # Status
 //!
-//! **Early.** A FAT32 volume can be mounted, walked, read, written, grown
-//! and truncated; long names and directories are both read and created.
-//! Every claim below is checked against `fsck.vfat` and `mtools`, which are
-//! independent implementations.
+//! **Early.** A FAT32 volume can be mounted, walked, read, written, grown,
+//! truncated and renamed; long names and directories are both read and
+//! created, and files and directories move between directories. Every
+//! claim below is checked against `fsck.vfat` and `mtools`, which are
+//! independent implementations, including what an interruption at each
+//! write leaves behind.
 //!
-//! What is missing is native adapters for the block devices real hardware
-//! provides — the `bridge` module, behind the `embedded-sdmmc` feature,
-//! covers those in the meantime. The version number should be read as an
-//! early one, and the API will change.
+//! Block devices come from outside: implement [`BlockDevice`] for your
+//! driver, use a HAL that already does — `rpi-hal`'s SD adapters do — or
+//! bridge one you have for `embedded-sdmmc` through the `bridge` module,
+//! behind the feature of that name. The version number should be read as
+//! an early one, and the API will change.
 //!
 //! # Getting a block device
 //!

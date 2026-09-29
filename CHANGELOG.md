@@ -18,6 +18,28 @@ moved.
 
 ### Added
 
+- **`FileSystem::rename(from, to)`**: renames or moves a file or
+  directory, replacing a file already at `to`. No data moves; only
+  directory entries change, keeping the file's attributes and timestamps.
+  FAT has no atomic rename, so the order of the writes is what decides
+  what an interruption leaves, and it differs by case:
+  - **file over file** — `from` deleted, then `to`'s entry repointed at
+    its data in one sector write, then `to`'s old data freed. `to` always
+    names a whole file, old or new, and no cluster ever belongs to two
+    names: write-then-rename is now a safe way to replace a file;
+  - **same directory, a name taking no more slots** — rewritten in place,
+    so an interruption leaves the file under its old name, its new one,
+    or its 8.3 alias, never lost or shared;
+  - **to another directory, or a longer name** — new entries, then the
+    old ones deleted. The one case with a window: interrupted between the
+    two, both names share the file's chain, which loses nothing and which
+    `fsck.vfat` repairs.
+
+  A directory moved to another parent has its `..` repointed; moving one
+  inside itself is the new **`Error::MoveIntoItself`**. Handles to the
+  renamed file, and to a file it replaced, go stale. Each case is checked
+  against `fsck.vfat` and `mtools`, and interrupted at every write.
+
 - **`counted::Counted`**, a block device wrapper that counts every read
   and write — calls and blocks — into a caller-owned `counted::Counters`,
   usually a `static`, so a snapshot can be taken wherever the numbers are
@@ -29,7 +51,13 @@ moved.
   wrapper has to. On targets with 32-bit atomics; moved from
   `rpi-water-sensor`, where it measured the 67× OTA speed-up.
 
-No change to what is written to the card.
+### Changed
+
+- **The README's Status section**, which still said native block device
+  adapters were missing. `rpi-hal` ships them.
+
+No change to what is written to the card by any operation that existed
+before; `rename` is new, so everything it writes is.
 
 ## [0.2.0] - 2026-09-29
 
