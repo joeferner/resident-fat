@@ -376,14 +376,43 @@ impl<D: BlockDevice> FileSystem<D> {
     /// choosing an 8.3 alias nothing else has. With the directory resident
     /// neither costs a device call.
     fn plan_name(&mut self, directory: u32, name: &str) -> Result<StoredName, D::Error> {
+        self.plan_name_except(directory, name, None, false)
+    }
+
+    /// [`plan_name`](Self::plan_name), for renaming the entry at `except`.
+    ///
+    /// That entry does not collide with the new name — it is the one being
+    /// renamed, and a name differing only in case finds it. Whether it
+    /// counts against the 8.3 alias is `reuse_alias`: yes when the new
+    /// entry is written over it, so the file can keep its alias; no when
+    /// the old entry is still live on the device while the new one is
+    /// written, since two live entries must not share one.
+    fn plan_name_except(
+        &mut self,
+        directory: u32,
+        name: &str,
+        except: Option<u32>,
+        reuse_alias: bool,
+    ) -> Result<StoredName, D::Error> {
         let codepage = *self.codepage();
         let parsed = self.read_dir(directory)?;
-        if parsed.get(name).is_some() {
+        let other = |candidate: &str| {
+            parsed
+                .get(candidate)
+                .is_some_and(|entry| Some(entry.index()) != except)
+        };
+        if other(name) {
             return Err(Error::AlreadyExists {
                 name: String::from(name),
             });
         }
-        crate::name::stored_name(name, &codepage, &mut |alias| parsed.get(alias).is_some())
+        crate::name::stored_name(name, &codepage, &mut |alias| {
+            if reuse_alias {
+                other(alias)
+            } else {
+                parsed.get(alias).is_some()
+            }
+        })
     }
 
     /// Lays a name's entries out ready to write: the long-name slots, then
@@ -770,6 +799,258 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(())
     }
 
+    /// Renames or moves the file or directory at `from` to `to`, replacing a
+    /// file already at `to`.
+    ///
+    /// Nothing is copied: the data stays in its clusters, and only
+    /// directory entries change. Both paths are `/`-separated and resolve
+    /// the way [`open`](Self::open) does. A name differing from the old one
+    /// only in case is a rename; an identical one does nothing.
+    ///
+    /// Handles to `from` are stale afterwards, as are handles to a file it
+    /// replaced — see [`File`] on staleness.
+    ///
+    /// FAT has no atomic rename, so what an interruption leaves behind is
+    /// decided by the order of the writes, and the three cases below differ.
+    ///
+    /// # Replacing a file, and why that is the useful case
+    ///
+    /// The one way to change a file that an interruption cannot leave
+    /// half-written is to write the new contents under another name and
+    /// rename it over the old: `settings.new` → `settings.toml`. This makes
+    /// that work: **`to` always names a whole file**, the old one or the
+    /// new one, and never nothing and never part of one.
+    ///
+    /// `from`'s entry is deleted first, then `to`'s entry is repointed at
+    /// `from`'s data — first cluster, size, attributes and timestamps — in
+    /// one write of one sector, and only then is `to`'s old data freed.
+    /// Interrupted before the repoint, `to` is the old file and the new
+    /// data is allocated to nothing: the save did not happen, and `fsck`
+    /// reclaims the space. Interrupted after it, `to` is the new file and
+    /// the old data is what leaks. No cluster ever belongs to two names —
+    /// repointing first would have `to` and `from` sharing one chain until
+    /// `from` was deleted.
+    ///
+    /// Only a file replaces a file. A directory at `to`, or a directory at
+    /// `from` with anything at `to`, is [`Error::AlreadyExists`].
+    ///
+    /// # A new name in the same directory
+    ///
+    /// When the new name takes no more directory slots than the old one,
+    /// the entry is rewritten where it stands: the new long-name slots and
+    /// the 8.3 entry, in ascending order, over the old ones, and any the
+    /// shorter name no longer needs deleted afterwards. An interruption
+    /// can leave long-name slots whose checksum does not match the 8.3
+    /// entry after them, which every reader ignores — so the file is found
+    /// under its old or its new name, or at worst under its 8.3 alias, and
+    /// is never lost or shared.
+    ///
+    /// # Anything else
+    ///
+    /// A move to another directory, or a name longer than the slots it
+    /// has: the new entries are written first, then the old ones deleted.
+    /// This is the one case with no ordering free of a window. Interrupted
+    /// between the two, the file has both names — two entries sharing one
+    /// chain, which `fsck.vfat` reports and repairs by dropping one. The
+    /// other order would leave the data named by nothing, which `fsck`
+    /// reclaims as lost; sharing loses nothing, so it is the lesser.
+    ///
+    /// A directory moved to another parent has its `..` pointed at the new
+    /// one, between the two steps. Moving a directory inside itself or
+    /// anything it contains is [`Error::MoveIntoItself`].
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<(), D::Error> {
+        let (from_parent, from_name) = split_path(from);
+        let (to_parent, to_name) = split_path(to);
+        for name in [from_name, to_name] {
+            if name.is_empty() || name == "." || name == ".." {
+                return Err(Error::BadName {
+                    name: String::from(name),
+                });
+            }
+        }
+        let from_dir = self.resolve_dir(from_parent)?;
+        let to_dir = self.resolve_dir(to_parent)?;
+
+        let source = self
+            .read_dir(from_dir)?
+            .get(from_name)
+            .map(Placed::of)
+            .ok_or_else(|| Error::NotFound {
+                name: String::from(from_name),
+            })?;
+        let target = self.read_dir(to_dir)?.get(to_name).map(Placed::of);
+
+        match target {
+            Some(target) if to_dir == from_dir && target.index == source.index => {
+                // The same entry: a change of case, or no change at all.
+                let current = self.read_dir(from_dir)?.at(source.index).map(|e| e.name());
+                if current == Some(to_name) {
+                    return Ok(());
+                }
+                self.rename_here(source, from_dir, to_name)
+            }
+            Some(target) => {
+                if target.is_directory || source.is_directory {
+                    return Err(Error::AlreadyExists {
+                        name: String::from(to_name),
+                    });
+                }
+                self.replace_file(source, from_dir, target, to_dir)
+            }
+            None if to_dir == from_dir => self.rename_here(source, from_dir, to_name),
+            None => self.move_to_new_name(source, from_dir, to_dir, to_name),
+        }
+    }
+
+    /// `rename`'s file-over-file case. See [`rename`](Self::rename) for why
+    /// the writes are in this order.
+    fn replace_file(
+        &mut self,
+        source: Placed,
+        from_dir: u32,
+        target: Placed,
+        to_dir: u32,
+    ) -> Result<(), D::Error> {
+        let contents = self.read_entry(from_dir, source.index)?;
+        // `from` goes first: from here until the repoint, the new data is
+        // named by nothing, which is a leak rather than two names on one
+        // chain.
+        self.delete_entries(from_dir, source.first_slot, source.index)?;
+        // A handle to what `to` held would otherwise still match its slot,
+        // and write into the chain freed below.
+        self.invalidate_handles(to_dir);
+        self.edit_entry(to_dir, target.index, |entry| {
+            crate::dir::take_contents(entry, &contents);
+        })?;
+        if target.first_cluster != 0 {
+            self.fat_mut().free_chain(target.first_cluster)?;
+            self.flush_fat()?;
+        }
+        Ok(())
+    }
+
+    /// `rename` within one directory. In place when the new name's slots
+    /// fit in the old one's run — see [`rename`](Self::rename) for why that
+    /// is the safe way — and by [`move_to_new_name`](Self::move_to_new_name)
+    /// when they do not.
+    fn rename_here(
+        &mut self,
+        source: Placed,
+        directory: u32,
+        to_name: &str,
+    ) -> Result<(), D::Error> {
+        // Rewritten in place, the new entry replaces the old one, so it may
+        // keep its 8.3 alias.
+        let stored = self.plan_name_except(directory, to_name, Some(source.index), true)?;
+        let have = source.index - source.first_slot + 1;
+        if stored.entries() > have {
+            // Not in place: the old entry stays live until the new one is
+            // written, so they must not share an alias.
+            let stored = self.plan_name_except(directory, to_name, Some(source.index), false)?;
+            return self.write_new_then_delete(source, directory, directory, &stored);
+        }
+
+        let mut short = self.read_entry(directory, source.index)?;
+        crate::dir::rename_entry(&mut short, &stored.short);
+        let mut entries = stored.slots.clone();
+        entries.push(short);
+
+        // The new run ends where the old one does, on the entry's own 8.3
+        // slot, and is written in ascending order so that slot goes last.
+        let new_first = source.index + 1 - stored.entries();
+        self.write_entries(directory, new_first, &entries)?;
+        if new_first > source.first_slot {
+            // The old name's leading slots, which the shorter one does not
+            // reach. Left, they would be long-name parts orphaned in front of
+            // a run that begins after them.
+            self.delete_entries(directory, source.first_slot, new_first - 1)?;
+        }
+        Ok(())
+    }
+
+    /// `rename` to another directory. See [`rename`](Self::rename) on the
+    /// window this leaves, which is why it is not used within one.
+    fn move_to_new_name(
+        &mut self,
+        source: Placed,
+        from_dir: u32,
+        to_dir: u32,
+        to_name: &str,
+    ) -> Result<(), D::Error> {
+        if source.is_directory && self.is_within(to_dir, source.first_cluster)? {
+            return Err(Error::MoveIntoItself {
+                name: String::from(to_name),
+            });
+        }
+        let stored = self.plan_name(to_dir, to_name)?;
+        self.write_new_then_delete(source, from_dir, to_dir, &stored)
+    }
+
+    /// New entries carrying `source`'s fields under `stored`'s name in
+    /// `to_dir`, then `source`'s entries deleted — pointing a moved
+    /// directory's `..` at its new parent in between.
+    fn write_new_then_delete(
+        &mut self,
+        source: Placed,
+        from_dir: u32,
+        to_dir: u32,
+        stored: &StoredName,
+    ) -> Result<(), D::Error> {
+        let moving_directory = source.is_directory && to_dir != from_dir;
+        let mut short = self.read_entry(from_dir, source.index)?;
+        crate::dir::rename_entry(&mut short, &stored.short);
+        let mut entries = stored.slots.clone();
+        entries.push(short);
+
+        // Finding the slots may have grown the directory, and its new
+        // cluster has to be linked on the device before an entry is
+        // written into it -- see `grow_directory`.
+        let first_slot = self.free_slots(to_dir, stored.entries())?;
+        self.flush_fat()?;
+        self.write_entries(to_dir, first_slot, &entries)?;
+
+        if moving_directory {
+            // `..` names the parent, and 0 when the parent is the root --
+            // the one place a cluster an entry carries and the cluster a
+            // directory lives at differ.
+            let parent = if to_dir == self.root_cluster() {
+                0
+            } else {
+                to_dir
+            };
+            self.edit_entry(source.first_cluster, 1, |entry| {
+                crate::dir::set_first_cluster(entry, parent);
+            })?;
+        }
+
+        self.delete_entries(from_dir, source.first_slot, source.index)
+    }
+
+    /// Whether `directory` is `ancestor` or lies anywhere beneath it,
+    /// following `..` up to the root.
+    fn is_within(&mut self, directory: u32, ancestor: u32) -> Result<bool, D::Error> {
+        let root = self.root_cluster();
+        let mut at = directory;
+        // Bounded by the cluster count: a well-formed tree reaches the root
+        // in fewer steps than there are clusters, and a `..` loop in a
+        // damaged one must not hang the caller.
+        for _ in 0..=self.fat().cluster_count() {
+            if at == ancestor {
+                return Ok(true);
+            }
+            if at == root {
+                return Ok(false);
+            }
+            let parent = self
+                .read_dir(at)?
+                .get("..")
+                .map(|entry| entry.first_cluster())
+                .unwrap_or(0);
+            at = if parent == 0 { root } else { parent };
+        }
+        Ok(false)
+    }
+
     /// Makes sure the file has clusters for at least `size` bytes.
     fn reserve(&mut self, file: &mut File, size: u32) -> Result<(), D::Error> {
         let now = self.now();
@@ -927,6 +1208,27 @@ impl<D: BlockDevice> FileSystem<D> {
             self.write_blocks(block, &scratch)?;
         }
         Ok(())
+    }
+}
+
+/// Where a directory entry is, and the little `rename` needs to know about
+/// what it names — copied out of the parsed directory so its borrow ends.
+#[derive(Debug, Clone, Copy)]
+struct Placed {
+    index: u32,
+    first_slot: u32,
+    first_cluster: u32,
+    is_directory: bool,
+}
+
+impl Placed {
+    fn of(entry: &crate::dir::DirEntry) -> Self {
+        Placed {
+            index: entry.index(),
+            first_slot: entry.first_slot(),
+            first_cluster: entry.first_cluster(),
+            is_directory: entry.is_directory(),
+        }
     }
 }
 

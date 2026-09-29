@@ -711,6 +711,35 @@ pub(crate) fn update_entry(into: &mut [u8], first_cluster: u32, size: u32, at: D
     into[0x1C..0x20].copy_from_slice(&size.to_le_bytes());
 }
 
+/// Rewrites just the first cluster of an existing entry, leaving its
+/// timestamps alone — for a `..` entry pointed at a directory's new parent,
+/// which is a change to where the directory lives rather than to it.
+pub(crate) fn set_first_cluster(into: &mut [u8], first_cluster: u32) {
+    into[0x14..0x16].copy_from_slice(&((first_cluster >> 16) as u16).to_le_bytes());
+    into[0x1A..0x1C].copy_from_slice(&((first_cluster & 0xFFFF) as u16).to_le_bytes());
+}
+
+/// Gives the entry at `into` the name `name` stands for, keeping every other
+/// field it has: attributes, timestamps, first cluster and size.
+///
+/// The case bits travel with the name, since they describe how its eleven
+/// bytes are displayed.
+pub(crate) fn rename_entry(into: &mut [u8], name: &ShortName) {
+    into[0..11].copy_from_slice(name.as_bytes());
+    into[0x0C] = name.case_flags;
+}
+
+/// Points the entry at `into` at the file `source` describes — its
+/// attributes, timestamps, first cluster and size — keeping `into`'s own
+/// name and case bits.
+///
+/// The long-name slots in front of `into` carry a checksum of those name
+/// bytes, which this leaves untouched, so they go on naming this entry.
+pub(crate) fn take_contents(into: &mut [u8], source: &[u8]) {
+    into[0x0B] = source[0x0B];
+    into[0x0D..ENTRY_SIZE].copy_from_slice(&source[0x0D..ENTRY_SIZE]);
+}
+
 /// Marks an entry deleted, leaving the rest of it readable.
 pub(crate) fn mark_deleted(into: &mut [u8]) {
     into[0] = DELETED;
