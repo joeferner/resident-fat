@@ -14,6 +14,23 @@ a release — the previous version's volumes are the compatibility surface.
 Anything in that category gets an entry here whether or not the Rust API
 moved.
 
+## [Unreleased]
+
+### Added
+
+- **`counted::Counted`**, a block device wrapper that counts every read
+  and write — calls and blocks — into a caller-owned `counted::Counters`,
+  usually a `static`, so a snapshot can be taken wherever the numbers are
+  wanted rather than only where the volume is held. `Counters::since`
+  differences two snapshots with wrapping arithmetic, and
+  `counted::Counts` prints as one line ending in blocks per call, the
+  figure that says whether a volume is being written in runs or a block
+  at a time. It forwards `max_transfer_blocks`, which a transparent
+  wrapper has to. On targets with 32-bit atomics; moved from
+  `rpi-water-sensor`, where it measured the 67× OTA speed-up.
+
+No change to what is written to the card.
+
 ## [0.2.0] - 2026-09-29
 
 ### Added

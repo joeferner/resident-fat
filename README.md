@@ -33,6 +33,12 @@ written one block at a time, and re-reading the allocation table from the
 device — twice, since a volume carries two copies — for every cluster
 linked.
 
+To see the count on your own hardware, wrap the device in
+`counted::Counted`: it counts calls and blocks into a `Counters` you own,
+and a snapshot either side of an operation prints as
+`3 reads/3200 blocks, 1 writes/3200 blocks, 1600.0 blocks per call`.
+Blocks per call is the figure — ten would be a command per block.
+
 ## Using it
 
 Supply a block device — implement `BlockDevice`, or enable the
