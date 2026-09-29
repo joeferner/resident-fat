@@ -199,6 +199,8 @@ pub mod boot;
 #[cfg_attr(docsrs, doc(cfg(feature = "embedded-sdmmc")))]
 pub mod bridge;
 pub mod codepage;
+#[cfg(target_has_atomic = "32")]
+pub mod counted;
 pub mod dir;
 pub mod error;
 pub mod fat;
@@ -218,7 +220,8 @@ mod name;
 // hands back a `BootSector`, so `BootSector` belongs here too.
 //
 // The feature-gated modules are the exception: `mbr` and `bridge` stay
-// reached by their module path, which says which feature they need at the
+// reached by their module path -- as does `counted`, which is gated on the
+// target having atomics -- which says which feature they need at the
 // use site rather than leaving a name to disappear from the root when a
 // feature is off.
 pub use blockdev::{BLOCK_SIZE, BlockDevice};
