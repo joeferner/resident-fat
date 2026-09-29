@@ -54,7 +54,7 @@ its size.
 
 ## Mounting
 
-Three ways in, so the common cases are not guesswork:
+Four ways in, so the common cases are not guesswork:
 
 - `FileSystem::mount(device)` — the whole device is the volume, which is
   what `mkfs.vfat` on a raw device produces.
@@ -62,12 +62,16 @@ Three ways in, so the common cases are not guesswork:
   number you already know.
 - `FileSystem::mount_partition(device, 0)` — read the partition table and
   mount that slot. Needs the `mbr` feature.
+- `FileSystem::mount_first_fat(device)` — whichever the card is: the first
+  partition whose type says FAT, or the whole device if it has no table.
+  Needs the `mbr` feature.
 
-The third is the one for a card an imaging tool wrote, and it exists
+The last two are the ones for a card an imaging tool wrote, and they exist
 because telling a partition table from a boot sector is not something every
 consumer should be reimplementing: the two end with the same `0x55AA`
 signature, and reading one as the other yields block numbers that are wrong
-but plausible.
+but plausible. `mount_first_fat` is the one to reach for when the card's
+layout is not yours to decide.
 
 ## What makes it different
 
@@ -130,7 +134,7 @@ dependency on it compiles clean and is discovered by a consumer instead.
 
 | Feature | Default | What it does |
 | --- | --- | --- |
-| `mbr` | no | Reading partition tables, so mounting a card an imaging tool wrote does not need a second crate. About a hundred lines and no dependencies. Adds `FileSystem::mount_partition` and the `mbr` module. GPT is not supported; the protective record a GPT disk carries is recognised and declined rather than mounted. |
+| `mbr` | no | Reading partition tables, so mounting a card an imaging tool wrote does not need a second crate. About a hundred lines and no dependencies. Adds `FileSystem::mount_partition`, `FileSystem::mount_first_fat` and the `mbr` module. GPT is not supported; the protective record a GPT disk carries is recognised and declined rather than mounted. |
 | `embedded-sdmmc` | no | A blanket bridge from [`embedded_sdmmc::BlockDevice`][sdmmc] to this crate's block device trait, so an existing driver works here unchanged. Enabling it makes `embedded-sdmmc` a *public* dependency: a semver-breaking release there breaks this crate's API too, which is why it is opt-in. |
 
 ## Licence

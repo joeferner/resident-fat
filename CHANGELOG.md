@@ -14,6 +14,25 @@ a release — the previous version's volumes are the compatibility surface.
 Anything in that category gets an entry here whether or not the Rust API
 moved.
 
+## [Unreleased]
+
+### Added
+
+- **`FileSystem::mount_first_fat`**, behind `mbr`: mounts a device's FAT
+  volume whichever way it was formatted — through a partition table, the
+  first partition whose type byte says FAT (by type rather than by slot,
+  and held to the partition's length); with no table, the whole device,
+  as `mount` does. What every board mounting a card written by an
+  imaging tool otherwise writes by hand, with the boot-sector-or-table
+  check that is easy to get wrong.
+- **`Error::NoFatPartition`**, for a table with nothing FAT in it —
+  distinct from `NoPartitionTable`, since there *is* a table and the fix
+  is a different one. `Error` is `#[non_exhaustive]`, so this is not a
+  breaking change.
+- **`FileSystem::first_block`**, the device block the volume begins at.
+
+No change to what is written to the card.
+
 ## [0.1.0] - 2026-09-01
 
 First release. There is no earlier version to have changed from, so what the
