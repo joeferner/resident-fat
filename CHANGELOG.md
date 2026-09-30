@@ -14,7 +14,7 @@ a release — the previous version's volumes are the compatibility surface.
 Anything in that category gets an entry here whether or not the Rust API
 moved.
 
-## [0.3.0] - 2026-09-29
+## [0.3.0] - 2026-09-30
 
 ### Added
 
