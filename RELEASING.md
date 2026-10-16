@@ -160,8 +160,9 @@ and a bare `0.2.0` silently does nothing at all. It must also match
 gh run watch
 ```
 
-The release job re-runs `make package`, then publishes. If you set up the
-required reviewer, approve it in the Actions UI when it parks.
+The release job re-runs `make package`, publishes, then creates the
+GitHub release (step 8). If you set up the required reviewer, approve it
+in the Actions UI when it parks.
 
 ### 7. Verify the publish
 
@@ -178,11 +179,23 @@ hand. A successful build shows "Available on crate feature
 `embedded-sdmmc`" badges on the bridge's items, which is what confirms the
 `--cfg docsrs` path and `all-features` both took effect.
 
-### 8. Create the GitHub release
+### 8. Check the GitHub release
+
+The release workflow's last step creates it, titled
+`resident-fat <version>`, with the version's `CHANGELOG.md` section as its
+notes. Check it exists and the notes are that one section:
+
+```sh
+gh release view v<version>
+```
 
 Not decoration: `CHANGELOG.md`'s version links point at
 `/releases/tag/v<version>`, which only resolves once a release object
 exists.
+
+If it's missing — the run was a `workflow_dispatch` re-run, which has no
+tag and skips the step, or the step itself failed — create it by hand with
+the same command the workflow runs:
 
 ```sh
 gh release create v<version> \
@@ -200,7 +213,8 @@ That closing address matches the link reference at the bottom of the file,
 not anything near the section, so the range runs past every older heading
 and the "notes" become the entire changelog. It fails silently — `gh`
 accepts whatever it is handed — so the only symptom is an over-long
-release page nobody rereads.
+release page nobody rereads. The workflow also refuses an empty section,
+which is what a version heading that doesn't match the tag produces.
 
 That's the release. Nothing further is required.
 

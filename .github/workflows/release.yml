@@ -21,6 +21,10 @@ jobs:
     # yourself as a required reviewer parks the workflow at "waiting for
     # approval" and gives one last look before the irreversible step.
     environment: crates-io
+    # `contents: write` is for the GitHub release made after publishing;
+    # everything before it only reads the repository.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
 
@@ -52,3 +56,31 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish
+
+      # After publishing, so a release that failed to publish gets no release
+      # page claiming otherwise. `CHANGELOG.md`'s version links point at
+      # `/releases/tag/v<version>`, which only resolves once this exists.
+      #
+      # Tag pushes only: a `workflow_dispatch` re-run has no tag to name the
+      # release after, and if the original run got this far the release is
+      # already there. The notes are the version's changelog section, cut at
+      # the *next* `## [` heading -- see RELEASING.md step 8 for why that is
+      # `awk` and not a `sed` range.
+      - name: GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="## [$version]" '
+            index($0, v) == 1 { inside = 1; next }
+            inside && /^## \[/ { exit }
+            inside { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "CHANGELOG.md has no ## [$version] section" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "resident-fat $version" \
+            --notes-file release-notes.md
