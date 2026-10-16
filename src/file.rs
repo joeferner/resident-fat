@@ -47,13 +47,14 @@ use crate::time::DateTime;
 ///
 /// Every read and every write checks for this and reports
 /// [`Error::StaleFile`] rather than acting on the wrong entry. The rule a
-/// caller can rely on: **a handle is invalidated by any deletion from its
-/// directory**, including the one [`write_file`](FileSystem::write_file)
-/// performs when it replaces an existing file. Deleting a sibling therefore
-/// invalidates it too, which is a false positive and the deliberate
-/// direction to err in — reopening the path costs a lookup in a resident
-/// directory, where the alternative is silently rewriting whichever file was
-/// given the slot.
+/// caller can rely on: **a handle is invalidated when its own file's
+/// directory entry is deleted, renamed or replaced** — by
+/// [`remove`](FileSystem::remove), by [`rename`](FileSystem::rename) from or
+/// over it, or by the deletion [`write_file`](FileSystem::write_file)
+/// performs when it replaces an existing file. Changes to other files in
+/// the same directory leave it alone, so a handle can be held open for as
+/// long as its file lives. Reopening the path is the remedy for a stale
+/// one, and costs a lookup in a resident directory.
 ///
 /// The check costs no device traffic: it compares against the parsed
 /// directory, which is already resident.
@@ -80,15 +81,14 @@ pub struct File {
     /// is compared rather than the long one because every entry has one, and
     /// it is the eleven bytes that physically occupy the slot.
     short_name: crate::dir::ShortName,
-    /// How many entries had been deleted from `directory` when this handle
-    /// was made.
+    /// The generation of the slot at `index` when this handle was made.
     ///
     /// The name alone cannot detect a file replaced by another of the same
     /// name, which is what happens on every
-    /// [`write_file`](FileSystem::write_file) over an existing path. This
-    /// moves whenever a slot in the directory is freed, so a handle from
-    /// before the replacement does not match one from after it.
-    deletions: u32,
+    /// [`write_file`](FileSystem::write_file) over an existing path. The
+    /// slot's generation moves whenever it is freed or repointed, so a
+    /// handle from before the replacement does not match one from after it.
+    generation: u32,
 }
 
 impl File {
@@ -99,7 +99,7 @@ impl File {
         index: u32,
         first_slot: u32,
         short_name: crate::dir::ShortName,
-        deletions: u32,
+        generation: u32,
     ) -> Self {
         File {
             first_cluster,
@@ -108,7 +108,7 @@ impl File {
             index,
             first_slot,
             short_name,
-            deletions,
+            generation,
         }
     }
 
@@ -156,7 +156,7 @@ impl<D: BlockDevice> FileSystem<D> {
             });
         }
         // Copied out so the borrow of the parsed directory ends here, which
-        // is what lets the deletion count below be read from `self`.
+        // is what lets the slot's generation below be read from `self`.
         let (first_cluster, size, index, first_slot, short_name) = (
             entry.first_cluster(),
             entry.len(),
@@ -172,7 +172,7 @@ impl<D: BlockDevice> FileSystem<D> {
             index,
             first_slot,
             short_name,
-            self.deletions(cluster),
+            self.generation(cluster, index),
         ))
     }
 
@@ -191,18 +191,18 @@ impl<D: BlockDevice> FileSystem<D> {
     ///
     /// # Two tests, because one is not enough
     ///
-    /// The deletion count catches a slot that was freed and retaken, which
-    /// the name cannot when the new occupant has the same name — the case
-    /// [`write_file`](Self::write_file) produces every time it replaces a
-    /// file.
+    /// The slot's generation catches a slot that was freed and retaken,
+    /// which the name cannot when the new occupant has the same name — the
+    /// case [`write_file`](Self::write_file) produces every time it replaces
+    /// a file.
     ///
-    /// The name catches what the count cannot: a handle whose recorded slot
-    /// never belonged to it in the first place, which is the shape a handle
-    /// carried across mounts has, since the counts of a fresh mount all start
-    /// at zero.
+    /// The name catches what the generation cannot: a handle whose recorded
+    /// slot never belonged to it in the first place, which is the shape a
+    /// handle carried across mounts has, since every generation of a fresh
+    /// mount starts at zero.
     fn check_live(&mut self, file: &File) -> Result<(), D::Error> {
-        let deletions = self.deletions(file.directory);
-        let live = deletions == file.deletions
+        let generation = self.generation(file.directory, file.index);
+        let live = generation == file.generation
             && self
                 .read_dir(file.directory)?
                 .at(file.index)
@@ -548,7 +548,7 @@ impl<D: BlockDevice> FileSystem<D> {
             index,
             first_slot,
             stored.short,
-            self.deletions(directory),
+            self.generation(directory, index),
         ))
     }
 
@@ -918,7 +918,7 @@ impl<D: BlockDevice> FileSystem<D> {
         self.delete_entries(from_dir, source.first_slot, source.index)?;
         // A handle to what `to` held would otherwise still match its slot,
         // and write into the chain freed below.
-        self.invalidate_handles(to_dir);
+        self.invalidate_slot(to_dir, target.index);
         self.edit_entry(to_dir, target.index, |entry| {
             crate::dir::take_contents(entry, &contents);
         })?;

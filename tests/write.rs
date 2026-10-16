@@ -753,11 +753,11 @@ fn the_staleness_check_touches_no_device() {
 /// Replacing a file under the same name invalidates a handle to the old one.
 ///
 /// The case a name comparison alone cannot see, and the reason the check
-/// also counts deletions: `write_file` over an existing path removes the
-/// entry and creates another with the same eleven name bytes, so the slot
-/// looks untouched while being a different file. FAT stores no inode, no
-/// generation and no creation cookie to tell them apart, which leaves the
-/// fact that a deletion happened as the only thing to notice.
+/// also tracks each slot's generation: `write_file` over an existing path
+/// removes the entry and creates another with the same eleven name bytes,
+/// so the slot looks untouched while being a different file. FAT stores no
+/// inode, no generation and no creation cookie to tell them apart, which
+/// leaves the fact that the slot was freed as the only thing to notice.
 ///
 /// Left undetected this is not cosmetic. Writing through the old handle
 /// rewrote the new file's length while its chain kept the old one's, and
@@ -790,15 +790,14 @@ fn replacing_a_file_invalidates_a_handle_to_the_old_one() {
     assert_fsck_clean(&image);
 }
 
-/// Deleting a sibling invalidates a handle, and that is the accepted cost.
+/// Deleting a sibling leaves a handle usable.
 ///
-/// A false positive: the handle's own entry is untouched. Counting deletions
-/// per directory rather than per slot is what makes same-name replacement
-/// detectable at all, and the price is this. Pinned so the trade is visible
-/// and so nobody narrows the count to a single slot without noticing what it
-/// gives up.
+/// The handle's own entry is untouched, so refusing it would be a false
+/// positive. Up to 0.3.0 the check counted deletions per directory and made
+/// exactly that mistake; generations per slot catch same-name replacement
+/// (above) without it.
 #[test]
-fn deleting_a_sibling_invalidates_a_handle_and_reopening_fixes_it() {
+fn deleting_a_sibling_leaves_a_handle_usable() {
     let image = mkfs_image("write-stale-sibling.img", 32, 4);
     let mut volume = FileSystem::mount(FileImage::open_rw(&image).expect("open")).expect("mount");
 
@@ -809,15 +808,88 @@ fn deleting_a_sibling_invalidates_a_handle_and_reopening_fixes_it() {
     let mut keep = volume.open("/KEEP.BIN").expect("open keep");
     volume.remove("/GO.BIN").expect("remove sibling");
 
-    match volume.write_at(&mut keep, 0, &[1u8; 32]) {
-        Err(Error::StaleFile { .. }) => {}
-        other => panic!("expected StaleFile for a sibling deletion, got {other:?}"),
-    }
-
-    // Reopening is the whole remedy, and the file was never damaged.
-    let mut keep = volume.open("/KEEP.BIN").expect("reopen");
     assert_eq!(volume.read_all(&keep).expect("read"), payload);
     volume.write_at(&mut keep, 0, &[1u8; 32]).expect("write");
+
+    // And the slot the sibling freed, retaken by a new file, is that file's
+    // alone: the kept handle still names its own file.
+    volume.write_file("/NEW.BIN", &[3u8; 16]).expect("new");
+    let mut expected = payload.clone();
+    expected[..32].fill(1);
+    assert_eq!(volume.read_all(&keep).expect("read again"), expected);
+
+    volume.sync().expect("sync");
+    drop(volume);
+    assert_fsck_clean(&image);
+}
+
+/// A file held open for reading survives a save routine run beside it over
+/// and over: write a temporary file, delete the slot's file, rename the
+/// temporary one into its place.
+///
+/// What a game does with its data file open while the player saves — and
+/// what failed under the per-directory count: the first save into a slot
+/// deletes nothing, so it worked, and every save over an existing slot
+/// staled the data file's handle, so the next read of it failed.
+#[test]
+fn a_handle_survives_save_routines_beside_it() {
+    let image = mkfs_image("write-stale-saves.img", 32, 4);
+    let mut volume = FileSystem::mount(FileImage::open_rw(&image).expect("open")).expect("mount");
+
+    let data = expected_content(64 * 1024);
+    volume.write_file("/doom.wad", &data).expect("data file");
+    let wad = volume.open("/doom.wad").expect("open");
+
+    for round in 0..4u8 {
+        for slot in 0..2 {
+            let save = format!("/doomsav{slot}.dsg");
+            let mut temp = volume.create("/temp.dsg").expect("create temp");
+            volume
+                .write_at(&mut temp, 0, &[round; 300])
+                .expect("write temp");
+            match volume.remove(&save) {
+                Ok(()) | Err(Error::NotFound { .. }) => {}
+                Err(e) => panic!("remove {save}: {e:?}"),
+            }
+            volume.rename("/temp.dsg", &save).expect("rename");
+
+            let mut lump = [0u8; 512];
+            let at = 1000 * u64::from(round) + 7;
+            volume.read_at(&wad, at, &mut lump).unwrap_or_else(|e| {
+                panic!("round {round} slot {slot}: read of the open file failed: {e:?}")
+            });
+            assert_eq!(lump[..], data[at as usize..at as usize + 512]);
+        }
+    }
+
+    for slot in 0..2 {
+        let save = volume
+            .open(&format!("/doomsav{slot}.dsg"))
+            .expect("open save");
+        assert_eq!(volume.read_all(&save).expect("read save"), [3u8; 300]);
+    }
+
+    volume.sync().expect("sync");
+    drop(volume);
+    assert_fsck_clean(&image);
+}
+
+/// Renaming a file over another leaves handles to a third file in the same
+/// directory usable, as deleting does.
+#[test]
+fn replacing_a_sibling_by_rename_leaves_a_handle_usable() {
+    let image = mkfs_image("write-stale-rename-sibling.img", 32, 4);
+    let mut volume = FileSystem::mount(FileImage::open_rw(&image).expect("open")).expect("mount");
+
+    let payload = expected_content(4096);
+    volume.write_file("/KEEP.BIN", &payload).expect("keep");
+    volume.write_file("/OLD.BIN", b"old").expect("old");
+    volume.write_file("/NEW.BIN", b"new").expect("new");
+
+    let keep = volume.open("/KEEP.BIN").expect("open keep");
+    volume.rename("/NEW.BIN", "/OLD.BIN").expect("replace");
+
+    assert_eq!(volume.read_all(&keep).expect("read"), payload);
 
     volume.sync().expect("sync");
     drop(volume);

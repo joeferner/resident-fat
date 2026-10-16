@@ -50,26 +50,31 @@ pub struct FileSystem<D: BlockDevice> {
     /// premise says does not arise. If that stops being true, eviction
     /// belongs here and nowhere else.
     directories: BTreeMap<u32, Directory>,
-    /// How many entries have been deleted from each directory, by first
-    /// cluster.
+    /// How many times each directory slot has been freed or repointed, by
+    /// directory first cluster and slot index. A slot never touched has
+    /// generation zero and no entry.
     ///
-    /// A [`File`](crate::File) handle records the count its directory had
-    /// when the handle was made, and a write refuses if the count has moved.
-    /// That is what makes a handle held across a deletion detectable at all:
+    /// A [`File`](crate::File) handle records the generation of its own
+    /// 8.3 slot when it is made, and is refused once that has moved. That is
+    /// what makes a handle held across a deletion detectable at all:
     /// deleting frees the slot, the next file created takes it, and the
     /// eleven name bytes the handle also checks are no help when the name is
-    /// the same — which is exactly what replacing a file does.
+    /// the same — which is exactly what replacing a file does. The slot's
+    /// generation moved when it was freed, so the old handle no longer
+    /// matches, whatever now occupies it.
     ///
-    /// Counted per directory rather than per volume so that deleting a file
-    /// in one directory does not invalidate handles into every other. It
-    /// still invalidates handles to *siblings*, which is a false positive
-    /// and the deliberate direction to err in: the caller reopens, where the
-    /// alternative is a silent rewrite of whichever file was given the slot.
+    /// Per slot rather than per directory, so deleting a file leaves handles
+    /// to its *siblings* alone. A per-directory count also caught
+    /// replacement, but staled every other handle in the directory with it:
+    /// a program holding a file open while deleting beside it — a game
+    /// keeping its data file open while it replaces saves in the same
+    /// directory — failed every read after the first deletion.
     ///
-    /// Never pruned. One `u32` per directory ever written to is nothing
-    /// beside the parsed directories themselves, and forgetting a count
-    /// would make the handles it was guarding valid again.
-    deletions: BTreeMap<u32, u32>,
+    /// Never pruned: forgetting a generation would make the handles it was
+    /// guarding valid again. It holds one entry per slot ever freed, which
+    /// is bounded by the directories' own size, since a slot that is reused
+    /// and freed again moves its existing entry rather than adding one.
+    generations: BTreeMap<(u32, u32), u32>,
     /// How 8.3 names are read and written. See [`crate::codepage`].
     codepage: Codepage,
     /// Where the timestamps on new entries come from. See
@@ -224,7 +229,7 @@ impl<D: BlockDevice> FileSystem<D> {
             fat,
             first_block,
             directories: BTreeMap::new(),
-            deletions: BTreeMap::new(),
+            generations: BTreeMap::new(),
             codepage,
             clock: alloc::boxed::Box::new(crate::time::EpochClock),
             marked_dirty: false,
@@ -847,13 +852,14 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(entry)
     }
 
-    /// Makes every handle into `directory` stale, as a deletion there would.
+    /// Makes every handle to slot `index` of `directory` stale, as deleting
+    /// it would.
     ///
     /// For a change that repoints an entry at other clusters without freeing
     /// its slot: a handle to what the entry used to name would still pass
     /// the name check, and write into clusters that are about to be freed.
-    pub(crate) fn invalidate_handles(&mut self, directory: u32) {
-        *self.deletions.entry(directory).or_insert(0) += 1;
+    pub(crate) fn invalidate_slot(&mut self, directory: u32, index: u32) {
+        *self.generations.entry((directory, index)).or_insert(0) += 1;
     }
 
     /// Reads, changes and writes back one directory entry.
@@ -931,11 +937,18 @@ impl<D: BlockDevice> FileSystem<D> {
         first: u32,
         last: u32,
     ) -> Result<(), D::Error> {
-        // Before the write, so a handle is never usable against a slot that
+        // Before the writes, so a handle is never usable against a slot that
         // has already been freed on the device. Counted even if the writes
         // below fail: the 8.3 entry goes first, so a failure part-way has
         // already freed the slot that matters.
-        *self.deletions.entry(directory).or_insert(0) += 1;
+        //
+        // Every slot, not just the 8.3 entry's, though a handle only ever
+        // records an 8.3 slot: a file created next can put its 8.3 entry
+        // where this one's long name was, and must not inherit a
+        // generation some older handle to that slot still matches.
+        for index in first..=last {
+            self.invalidate_slot(directory, index);
+        }
 
         self.edit_entry(directory, last, crate::dir::mark_deleted)?;
         for index in (first..last).rev() {
@@ -944,12 +957,15 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(())
     }
 
-    /// How many entries have been deleted from `directory` under this mount.
+    /// The generation of slot `index` of `directory` under this mount.
     ///
     /// Stamped onto a [`File`](crate::File) when it is opened and compared
-    /// when it is written through; see the field this reads.
-    pub(crate) fn deletions(&self, directory: u32) -> u32 {
-        self.deletions.get(&directory).copied().unwrap_or(0)
+    /// when it is read or written through; see the field this reads.
+    pub(crate) fn generation(&self, directory: u32, index: u32) -> u32 {
+        self.generations
+            .get(&(directory, index))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// The first of `count` consecutive free slots in `directory`, growing
