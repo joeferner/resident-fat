@@ -92,7 +92,33 @@ pub struct FileSystem<D: BlockDevice> {
     /// Also the record of whether anything has been written at all, which is
     /// what lets a sync with nothing to do cost nothing.
     marked_dirty: bool,
+    /// The runs of chains recently read through
+    /// [`read_at`](Self::read_at), by first cluster.
+    ///
+    /// Walking a chain is a pass over its every table entry, and `read_at`
+    /// needs the runs on every call, however small: without this, a
+    /// program reading a large file a kilobyte at a time — a game reading
+    /// lumps out of its data file — spends most of each read walking the
+    /// same chain again.
+    run_cache: RunCache,
 }
+
+/// See [`FileSystem::run_cache`].
+///
+/// Valid only while the table is unchanged since `changes` was taken from
+/// [`Fat::changes`]: every write to the table goes through one method that
+/// counts it, so a cache that sees the count move throws everything away
+/// rather than working out which chains a write touched.
+#[derive(Default)]
+struct RunCache {
+    changes: u64,
+    chains: BTreeMap<u32, Vec<Run>>,
+}
+
+/// The most chains [`RunCache`] holds. It is cleared outright when full:
+/// the reads it serves come from a handful of open files, and a volume
+/// read across more than this many files at once loses only the caching.
+const RUN_CACHE_CHAINS: usize = 16;
 
 impl<D: BlockDevice + core::fmt::Debug> core::fmt::Debug for FileSystem<D> {
     /// Written out rather than derived, because a clock is a trait object
@@ -233,6 +259,7 @@ impl<D: BlockDevice> FileSystem<D> {
             codepage,
             clock: alloc::boxed::Box::new(crate::time::EpochClock),
             marked_dirty: false,
+            run_cache: RunCache::default(),
         })
     }
 
@@ -455,6 +482,35 @@ impl<D: BlockDevice> FileSystem<D> {
     /// [`fat`](Self::fat) directly for the narrower [`FatError`].
     pub fn runs(&self, cluster: u32) -> Result<Vec<Run>, D::Error> {
         Ok(self.fat.runs(cluster)?)
+    }
+
+    /// The runs of the chain starting at `cluster`, from the cache if they
+    /// are there and the table hasn't changed since, walked otherwise.
+    ///
+    /// Taken out of the cache rather than borrowed from it, so the caller
+    /// can go on to read through `self`; hand them back with
+    /// [`keep_runs`](Self::keep_runs) to keep them cached.
+    pub(crate) fn take_runs(&mut self, cluster: u32) -> Result<Vec<Run>, D::Error> {
+        if self.run_cache.changes != self.fat.changes() {
+            self.run_cache.chains.clear();
+            self.run_cache.changes = self.fat.changes();
+        }
+        match self.run_cache.chains.remove(&cluster) {
+            Some(runs) => Ok(runs),
+            None => self.runs(cluster),
+        }
+    }
+
+    /// Returns runs from [`take_runs`](Self::take_runs) to the cache —
+    /// unless the table changed in the meantime, when they may be wrong.
+    pub(crate) fn keep_runs(&mut self, cluster: u32, runs: Vec<Run>) {
+        if self.run_cache.changes != self.fat.changes() {
+            return;
+        }
+        if self.run_cache.chains.len() >= RUN_CACHE_CHAINS {
+            self.run_cache.chains.clear();
+        }
+        self.run_cache.chains.insert(cluster, runs);
     }
 
     /// Reads a run's clusters into `into`, in one device transfer.

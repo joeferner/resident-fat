@@ -110,6 +110,12 @@ pub struct Fat {
     /// keeps files contiguous.
     next_free: u32,
     free_count: u32,
+    /// How many entries have been written since the table was loaded.
+    /// [`set_entry`](Self::set_entry) is the only writer, so a reader that
+    /// derived something from the table — a chain's runs — can tell whether
+    /// it still holds by comparing this, without tracking which operations
+    /// change what.
+    changes: u64,
     entries_per_sector: u32,
     bytes_per_sector: u32,
     sectors_per_fat: u32,
@@ -194,6 +200,7 @@ impl Fat {
             dirty,
             next_free: FIRST_CLUSTER,
             free_count,
+            changes: 0,
             entries_per_sector: u32::from(boot.bytes_per_sector) / 4,
             bytes_per_sector: u32::from(boot.bytes_per_sector),
             sectors_per_fat: boot.sectors_per_fat,
@@ -205,6 +212,12 @@ impl Fat {
     /// How many clusters the volume has.
     pub fn cluster_count(&self) -> u32 {
         self.cluster_count
+    }
+
+    /// How many entries have been written since the table was loaded; see
+    /// the field.
+    pub(crate) fn changes(&self) -> u64 {
+        self.changes
     }
 
     /// Whether `cluster` is one this volume can address.
@@ -238,6 +251,7 @@ impl Fat {
         let now_free = value & ENTRY_MASK == FREE;
 
         self.entries[at] = (self.entries[at] & !ENTRY_MASK) | (value & ENTRY_MASK);
+        self.changes += 1;
         self.mark_dirty(cluster);
 
         match (was_free, now_free) {
