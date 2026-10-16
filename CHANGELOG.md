@@ -14,7 +14,7 @@ a release — the previous version's volumes are the compatibility surface.
 Anything in that category gets an entry here whether or not the Rust API
 moved.
 
-## [Unreleased]
+## [0.3.1] - 2026-10-16
 
 ### Changed
 
@@ -128,7 +128,7 @@ native adapters for the block devices real hardware provides — the
 `embedded-sdmmc` bridge covers those in the meantime — and the API will
 change.
 
-[Unreleased]: https://github.com/joeferner/resident-fat/compare/v0.3.0...HEAD
+[0.3.1]: https://github.com/joeferner/resident-fat/releases/tag/v0.3.1
 [0.3.0]: https://github.com/joeferner/resident-fat/releases/tag/v0.3.0
 [0.2.0]: https://github.com/joeferner/resident-fat/releases/tag/v0.2.0
 [0.1.0]: https://github.com/joeferner/resident-fat/releases/tag/v0.1.0
