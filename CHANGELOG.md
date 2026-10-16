@@ -14,6 +14,23 @@ a release — the previous version's volumes are the compatibility surface.
 Anything in that category gets an entry here whether or not the Rust API
 moved.
 
+## [Unreleased]
+
+### Fixed
+
+- **Deleting or replacing a file no longer stales handles to its
+  siblings.** A `File` handle was refused with `Error::StaleFile` after
+  *any* deletion in its directory, because staleness was counted per
+  directory. A program holding one file open while deleting beside it
+  failed every later read of the open file until it reopened: a game
+  reading its data file while replacing saved games in the same directory
+  (write a temporary file, `remove` the old save, `rename` over it) broke
+  on the first save over an existing slot. Staleness is now tracked per
+  directory slot, so a handle is refused only when its own entry is
+  deleted, renamed or replaced. Replacement under the same name is still
+  caught: the slot's generation moves when it is freed, whatever retakes
+  it. Nothing written to the card changes.
+
 ## [0.3.0] - 2026-09-30
 
 ### Added
@@ -93,6 +110,7 @@ native adapters for the block devices real hardware provides — the
 `embedded-sdmmc` bridge covers those in the meantime — and the API will
 change.
 
+[Unreleased]: https://github.com/joeferner/resident-fat/compare/v0.3.0...HEAD
 [0.3.0]: https://github.com/joeferner/resident-fat/releases/tag/v0.3.0
 [0.2.0]: https://github.com/joeferner/resident-fat/releases/tag/v0.2.0
 [0.1.0]: https://github.com/joeferner/resident-fat/releases/tag/v0.1.0
