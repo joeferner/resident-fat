@@ -92,14 +92,16 @@ fn an_aligned_read_is_a_single_direct_transfer() {
     assert_eq!(buffer, all[offset as usize..]);
 }
 
-/// An unaligned read costs three calls — the two ragged ends and the whole
-/// blocks between them — and the middle one moves the bulk of the data.
+/// A large unaligned read costs three calls — the two ragged ends and the
+/// whole blocks between them — and the middle one moves the bulk of the
+/// data.
 ///
 /// The alternative implementation, reading every touched block into a
 /// temporary and copying out, would be one call here. It would also need a
 /// temporary as large as the read and would copy every byte twice, which
 /// for a megabyte-scale read is the worse trade. Asserting the shape keeps
-/// that decision from being undone by accident.
+/// that decision from being undone by accident. (A *small* ragged read is
+/// the other way round; see the next test.)
 #[test]
 fn an_unaligned_read_uses_scratch_only_at_the_ends() {
     let device = Recorder::new(FileImage::open(fixture("fat32-4k.img")).expect("open"));
@@ -107,7 +109,8 @@ fn an_unaligned_read_uses_scratch_only_at_the_ends() {
     let file = volume.open("/BIG.BIN").expect("open");
 
     let offset = 100u64; // inside the first block
-    let mut buffer = vec![0u8; 5 * BLOCK_SIZE + 37];
+    // Well past the span a small read gets in one call.
+    let mut buffer = vec![0u8; 20 * BLOCK_SIZE + 37];
 
     volume.device_mut().reset();
     volume.read_at(&file, offset, &mut buffer).expect("read");
@@ -127,6 +130,41 @@ fn an_unaligned_read_uses_scratch_only_at_the_ends() {
 
     let all = expected_content(offset as usize + buffer.len());
     assert_eq!(buffer, all[offset as usize..], "unaligned content differs");
+}
+
+/// A small ragged read is one call, however its ends fall.
+///
+/// The shape a C library's buffered `fread` produces after every `fseek`:
+/// a kilobyte or so from an arbitrary offset. Split into ragged ends and a
+/// middle it was up to three single-block calls, and a card charges per
+/// call — a game reading lumps out of its data file spent most of its
+/// startup on the extra two.
+#[test]
+fn a_small_unaligned_read_is_one_call() {
+    let device = Recorder::new(FileImage::open(fixture("fat32-4k.img")).expect("open"));
+    let mut volume = FileSystem::mount(device).expect("mount");
+    let file = volume.open("/BIG.BIN").expect("open");
+
+    // Both ends ragged, only the end ragged, a whole 4 KiB span ragged at
+    // both ends: each touches at most eight blocks.
+    for (offset, len) in [(300u64, 1024usize), (1024, 700), (77, 4 * 1024 - 77)] {
+        let mut buffer = vec![0u8; len];
+        volume.device_mut().reset();
+        volume.read_at(&file, offset, &mut buffer).expect("read");
+
+        let reads = volume.device_mut().reads();
+        assert_eq!(
+            reads.len(),
+            1,
+            "{len} bytes at {offset} should be one call: {reads:?}"
+        );
+        let all = expected_content(offset as usize + len);
+        assert_eq!(
+            buffer,
+            all[offset as usize..],
+            "content at {offset} differs"
+        );
+    }
 }
 
 /// A read entirely inside one block is a single call.

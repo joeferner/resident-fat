@@ -896,6 +896,80 @@ fn replacing_a_sibling_by_rename_leaves_a_handle_usable() {
     assert_fsck_clean(&image);
 }
 
+/// A file read, then grown into a second run, reads back whole: the runs
+/// `read_at` caches for a chain are dropped when the table changes.
+///
+/// Growing a file whose next cluster another file has taken extends its
+/// chain somewhere else. Runs cached from before would end at the old
+/// length, and the read past it would fail or come back short.
+#[test]
+fn reads_follow_a_chain_that_grew_after_it_was_read() {
+    let image = mkfs_image("write-runcache-grow.img", 32, 4);
+    let mut volume = FileSystem::mount(FileImage::open_rw(&image).expect("open")).expect("mount");
+
+    let first = expected_content(8 * 1024);
+    volume.write_file("/GROWS.BIN", &first).expect("create");
+    // Takes the clusters right after GROWS.BIN, so growing it can't stay
+    // contiguous.
+    volume
+        .write_file("/BLOCKER.BIN", &[5u8; 8 * 1024])
+        .expect("blocker");
+
+    let mut grows = volume.open("/GROWS.BIN").expect("open");
+    let mut probe = [0u8; 100];
+    volume.read_at(&grows, 50, &mut probe).expect("first read");
+
+    let more = vec![9u8; 12 * 1024];
+    volume
+        .write_at(&mut grows, first.len() as u64, &more)
+        .expect("grow");
+    assert!(
+        volume.runs(grows.first_cluster()).expect("runs").len() > 1,
+        "the test only bites if growing split the chain"
+    );
+
+    let mut expected = first.clone();
+    expected.extend_from_slice(&more);
+    assert_eq!(volume.read_all(&grows).expect("read grown"), expected);
+
+    volume.sync().expect("sync");
+    drop(volume);
+    assert_fsck_clean(&image);
+}
+
+/// A file deleted after being read, and a new one given its first cluster
+/// with a different chain, reads back as the new file.
+///
+/// The cache is keyed by first cluster, which the new file shares with the
+/// old one; its runs are not the old one's.
+#[test]
+fn reads_follow_a_first_cluster_reused_by_another_file() {
+    let image = mkfs_image("write-runcache-reuse.img", 32, 4);
+    let mut volume = FileSystem::mount(FileImage::open_rw(&image).expect("open")).expect("mount");
+
+    volume
+        .write_file("/OLD.BIN", &[1u8; 4 * 1024])
+        .expect("old");
+    let old = volume.open("/OLD.BIN").expect("open old");
+    let mut probe = [0u8; 100];
+    volume.read_at(&old, 10, &mut probe).expect("read old");
+    let first_cluster = old.first_cluster();
+    volume.remove("/OLD.BIN").expect("remove");
+
+    let payload = expected_content(20 * 1024);
+    let new = volume.write_file("/NEW.BIN", &payload).expect("new");
+    assert_eq!(
+        new.first_cluster(),
+        first_cluster,
+        "the test only bites if the new file reuses the first cluster"
+    );
+    assert_eq!(volume.read_all(&new).expect("read new"), payload);
+
+    volume.sync().expect("sync");
+    drop(volume);
+    assert_fsck_clean(&image);
+}
+
 /// Filling the volume leaves a free-space hint another implementation will
 /// accept.
 ///

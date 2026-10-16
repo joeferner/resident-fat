@@ -16,6 +16,24 @@ moved.
 
 ## [Unreleased]
 
+### Changed
+
+- **Small unaligned reads are one device call.** `read_at` split every
+  read into a partial first block, whole blocks and a partial last block,
+  so a kilobyte from an arbitrary offset — what a C library's buffered
+  `fread` issues after every `fseek` — cost three single-block calls. A
+  ragged read touching at most eight blocks (4 KiB) is now read in one
+  call through a stack scratch buffer. Larger reads keep the zero-copy
+  split.
+- **`read_at` no longer walks the whole cluster chain on every call.**
+  The runs of recently read chains (up to 16) are cached and reused until
+  the allocation table next changes. For an 11 MB file read a kilobyte at
+  a time, the walk was about 2,700 table entries per read.
+
+Measured on a Pi 2 with rpi-doom's startup, which reads 5,280 one-kilobyte
+pieces of an 11 MB WAD: 2.2 s in `read_at` before these changes. Nothing
+written to the card changes.
+
 ### Fixed
 
 - **Deleting or replacing a file no longer stales handles to its

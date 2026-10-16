@@ -15,6 +15,14 @@
 //! and copies every byte twice. For the megabyte-scale reads this crate is
 //! built for, two extra calls are cheaper than either.
 //!
+//! For a small read the balance tips the other way. A request of a few
+//! kilobytes at an arbitrary offset — what a C library's buffered `fread`
+//! issues after every `fseek` — would otherwise be three single-block
+//! calls, and a card charges per call, not per block. So a ragged read
+//! touching at most eight blocks (4 KiB) is one call into a stack scratch
+//! buffer that size, and copying a few kilobytes is far cheaper than the
+//! two calls it saves.
+//!
 //! An aligned read — which is what reading a whole file is — has no ragged
 //! ends at all, so it is one transfer per run and nothing is copied.
 
@@ -28,6 +36,15 @@ use crate::error::{Error, FatError, Result};
 use crate::fs::FileSystem;
 use crate::name::StoredName;
 use crate::time::DateTime;
+
+/// The most blocks a ragged read can touch and still be read in one
+/// device call through a scratch buffer, rather than split into a partial
+/// first block, whole blocks and a partial last block. See the module
+/// documentation for the trade.
+///
+/// Eight blocks is a 4 KiB scratch buffer on the stack: room for the
+/// buffer refills a C library issues, small enough for an embedded stack.
+const SMALL_SPAN_BLOCKS: usize = 8;
 
 /// Everything needed to read a file: where its data starts, and how much of
 /// it means anything.
@@ -265,7 +282,9 @@ impl<D: BlockDevice> FileSystem<D> {
         }
 
         let cluster_bytes = u64::from(self.boot_sector().cluster_bytes());
-        let runs = self.runs(file.first_cluster)?;
+        // Cached: a read walks no table entries when the chain was read
+        // before and the table hasn't changed since.
+        let runs = self.take_runs(file.first_cluster)?;
 
         let mut done = 0usize;
         let mut at = offset;
@@ -294,6 +313,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 break;
             }
         }
+        self.keep_runs(file.first_cluster, runs);
 
         if done != wanted {
             // The chain ran out before the length in the directory entry
@@ -309,15 +329,27 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Reads `into.len()` bytes starting `skip` bytes into `first_block`.
     ///
-    /// The three-part split described in this module's header. Callers pass
-    /// a range that lies inside one contiguous run, so every block here is
-    /// consecutive on the device.
+    /// The three-part split described in this module's header, or one call
+    /// through scratch for a small ragged read. Callers pass a range that
+    /// lies inside one contiguous run, so every block here is consecutive
+    /// on the device.
     fn read_span(
         &mut self,
         first_block: u64,
         skip: usize,
         into: &mut [u8],
     ) -> Result<(), D::Error> {
+        let ragged = skip != 0 || into.len() % BLOCK_SIZE != 0;
+        let span = (skip + into.len()).div_ceil(BLOCK_SIZE);
+        if ragged && span <= SMALL_SPAN_BLOCKS && span as u64 <= self.device().max_transfer_blocks()
+        {
+            let mut scratch = [0u8; SMALL_SPAN_BLOCKS * BLOCK_SIZE];
+            let scratch = &mut scratch[..span * BLOCK_SIZE];
+            self.read_blocks(first_block, scratch)?;
+            into.copy_from_slice(&scratch[skip..skip + into.len()]);
+            return Ok(());
+        }
+
         let mut block = first_block;
         let mut into = into;
 
